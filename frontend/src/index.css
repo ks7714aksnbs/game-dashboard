@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  body {
+    @apply bg-doom-dark text-gray-100 font-mono;
+    background-image: 
+      radial-gradient(ellipse at top, #1a0000 0%, #0a0a0a 60%);
+    min-height: 100vh;
+  }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-doom-dark; }
+  ::-webkit-scrollbar-thumb { @apply bg-doom-red rounded; }
+}
+
+@layer components {
+  .doom-panel {
+    @apply bg-doom-panel border border-doom-border rounded-lg p-4;
+  }
+  .doom-btn {
+    @apply bg-doom-red hover:bg-red-700 text-white font-bold py-2 px-4 rounded
+           transition-all duration-200 uppercase tracking-wider text-sm
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .doom-btn-outline {
+    @apply border border-doom-red text-doom-red hover:bg-doom-red hover:text-white
+           font-bold py-2 px-4 rounded transition-all duration-200 uppercase tracking-wider text-sm;
+  }
+  .doom-input {
+    @apply bg-black border border-doom-border text-gray-100 rounded px-3 py-2 w-full
+           focus:outline-none focus:border-doom-red transition-colors placeholder-gray-600;
+  }
+  .doom-label { @apply text-gray-400 text-xs uppercase tracking-widest mb-1 block; }
+  .glow-red { text-shadow: 0 0 10px #cc2200, 0 0 20px #cc2200; }
+  .glow-orange { text-shadow: 0 0 10px #ff6600; }
+  .scanline {
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+  }
+}
+
+/* Canvas game container */
+#game-canvas {
+  image-rendering: pixelated;
+  cursor: crosshair;
+}

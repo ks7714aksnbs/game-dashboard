@@ -1,0 +1,22 @@
+# render.yaml - place this in the backend/ directory root
+services:
+  - type: web
+    name: doom-platform-backend
+    runtime: java
+    buildCommand: mvn clean package -DskipTests
+    startCommand: java -jar target/doom-platform-backend-1.0.0.jar
+    envVars:
+      - key: DATABASE_URL
+        sync: false        # Set manually in Render dashboard
+      - key: DB_USERNAME
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PORT
+        value: "8080"
+    healthCheckPath: /api/leaderboard
+    autoDeploy: true

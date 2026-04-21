@@ -1,0 +1,687 @@
+import { useEffect, useRef, useState, useCallback } from 'react'
+import { useParams, useNavigate } from 'react-router-dom'
+import { gameApi } from '../api'
+import { useGameSocket } from '../hooks/useGameSocket'
+import useAuthStore from '../store/authStore'
+
+// ══════════════════════════════════════════════════════════════════════
+//  DOOM MAP (ported from your Python engine's map.py)
+// ══════════════════════════════════════════════════════════════════════
+const MINI_MAP = [
+  [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,3,3,3,3,0,0,0,2,2,2,0,0,1],
+  [1,0,0,0,0,0,4,0,0,0,0,0,2,0,0,1],
+  [1,0,0,0,0,0,4,0,0,0,0,0,2,0,0,1],
+  [1,0,0,3,3,3,3,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,4,0,0,0,4,0,0,0,0,0,0,1],
+  [1,1,1,3,1,3,1,1,1,3,0,0,3,1,1,1],
+  [1,1,1,1,1,1,1,1,1,3,0,0,3,1,1,1],
+  [1,1,1,1,1,1,1,1,1,3,0,0,3,1,1,1],
+  [1,1,3,1,1,1,1,1,1,3,0,0,3,1,1,1],
+  [1,4,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,2,0,0,0,0,0,3,4,0,4,3,0,1],
+  [1,0,0,5,0,0,0,0,0,0,3,0,3,0,0,1],
+  [1,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+  [1,4,0,0,0,0,0,0,4,0,0,4,0,0,0,1],
+  [1,1,3,3,0,0,3,3,1,3,3,1,3,1,1,1],
+  [1,1,1,3,0,0,3,1,1,1,1,1,1,1,1,1],
+  [1,3,3,4,0,0,4,3,3,3,3,3,3,3,3,1],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,0,0,5,0,0,0,5,0,0,0,5,0,0,0,3],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3],
+  [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],
+]
+
+// Wall colour palette (matches texture IDs 1-5)
+const WALL_COLORS = ['', '#7a1f1f','#1f4a7a','#7a4a1f','#4a7a1f','#7a1f7a']
+const FLOOR_COLOR  = '#1e1e1e'
+const CEILING_COLOR= '#0a0a0a'
+
+const W          = 800
+const H          = 450
+const FOV        = Math.PI / 3
+const HALF_FOV   = FOV / 2
+const NUM_RAYS   = W / 2          // 400 rays → each drawn 2px wide
+const MAX_DEPTH  = 20
+const PLAYER_SPEED    = 0.004
+const PLAYER_ROT_SPD  = 0.002
+const MOUSE_SENS      = 0.0015
+
+// ══════════════════════════════════════════════════════════════════════
+//  NPC logic (mirrors npc.py — simplified for browser)
+// ══════════════════════════════════════════════════════════════════════
+function createNPC(x, y, health = 100) {
+  return { x, y, health, alive: true, speed: 0.015, angle: 0,
+           color: '#cc2200', size: 0.4 }
+}
+
+function moveNPCtoward(npc, px, py, worldMap, dt) {
+  if (!npc.alive) return
+  const dx = px - npc.x, dy = py - npc.y
+  const dist = Math.hypot(dx, dy)
+  if (dist < 0.6) return
+  const step = npc.speed * dt
+  const nx = npc.x + (dx / dist) * step
+  const ny = npc.y + (dy / dist) * step
+  if (!worldMap.has(`${Math.floor(nx)},${Math.floor(npc.y)}`)) npc.x = nx
+  if (!worldMap.has(`${Math.floor(npc.x)},${Math.floor(ny)}`)) npc.y = ny
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  GameRoom component
+// ══════════════════════════════════════════════════════════════════════
+export default function GameRoom() {
+  const { code }       = useParams()
+  const navigate       = useNavigate()
+  const { user }       = useAuthStore()
+  const canvasRef      = useRef(null)
+  const stateRef       = useRef(null)          // mutable game state
+  const animRef        = useRef(null)
+
+  const [session,      setSession]      = useState(null)
+  const [players,      setPlayers]      = useState([])
+  const [remotePlayers,setRemotePlayers]= useState({})
+  const [gamePhase,    setGamePhase]    = useState('waiting') // waiting|playing|ended
+  const [score,        setScore]        = useState(0)
+  const [kills,        setKills]        = useState(0)
+  const [health,       setHealth]       = useState(100)
+  const [deaths,       setDeaths]       = useState(0)
+  const [elapsed,      setElapsed]      = useState(0)
+  const [events,       setEvents]       = useState([])
+  const [wsStatus,     setWsStatus]     = useState('connecting')
+  const [error,        setError]        = useState('')
+  const [gameStartTime,setGameStartTime]= useState(null)
+
+  // ── Build world-map set ─────────────────────────────────────────────
+  const worldMap = new Set()
+  MINI_MAP.forEach((row, y) => row.forEach((v, x) => { if (v) worldMap.add(`${x},${y}`) }))
+
+  // ── WebSocket handler ───────────────────────────────────────────────
+  const handleWsMessage = useCallback((msg) => {
+    switch (msg.type) {
+      case 'PLAYER_JOINED':
+        setPlayers(msg.payload?.players || [])
+        addEvent(`⚡ ${msg.username} joined`)
+        break
+      case 'PLAYER_LEFT':
+        setPlayers(msg.payload?.players || [])
+        addEvent(`💨 ${msg.username} left`)
+        break
+      case 'STATE_UPDATE':
+        const states = {}
+        ;(msg.payload?.players || []).forEach(p => {
+          if (p.username !== user?.username) states[p.username] = p
+        })
+        setRemotePlayers(states)
+        break
+      case 'GAME_START':
+        setGamePhase('playing')
+        setGameStartTime(Date.now())
+        addEvent('🎮 GAME STARTED!')
+        break
+      case 'GAME_END':
+        setGamePhase('ended')
+        addEvent('🏁 GAME OVER!')
+        break
+      case 'GAME_EVENT':
+        const ev = msg.payload
+        if (ev?.type === 'KILL' && ev.victim === user?.username) {
+          setDeaths(d => d + 1)
+          addEvent(`💀 You were killed by ${msg.username}`)
+          if (stateRef.current) stateRef.current.health = 100 // respawn
+        }
+        break
+      case 'PLAYER_SHOT':
+        // visual flash — handled in render
+        break
+    }
+  }, [user])
+
+  const { send, sendPlayerState, sendGameEvent, status: socketStatus } =
+    useGameSocket(code, handleWsMessage)
+
+  useEffect(() => setWsStatus(socketStatus), [socketStatus])
+
+  const addEvent = (msg) => {
+    setEvents(ev => [{ msg, id: Date.now() }, ...ev].slice(0, 6))
+  }
+
+  // ── Load session ────────────────────────────────────────────────────
+  useEffect(() => {
+    gameApi.getSession(code)
+      .then(r => {
+        setSession(r.data)
+        if (r.data.status === 'IN_PROGRESS') {
+          setGamePhase('playing')
+          setGameStartTime(Date.now())
+        }
+      })
+      .catch(() => setError('Session not found'))
+  }, [code])
+
+  // ── Elapsed timer ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (gamePhase !== 'playing') return
+    const id = setInterval(() => setElapsed(e => e + 1), 1000)
+    return () => clearInterval(id)
+  }, [gamePhase])
+
+  // ── Initialize & run game loop ──────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const ctx = canvas.getContext('2d')
+
+    // Initial player state (mirrors PLAYER_POS from settings.py)
+    stateRef.current = {
+      x: 1.5, y: 5.0, angle: 0,
+      health: 100, score: 0, kills: 0, deaths: 0,
+      shooting: false, reloading: false, reloadTimer: 0,
+      keys: {},
+      // NPCs
+      npcs: [
+        createNPC(5.5, 3.5),
+        createNPC(12.5, 8.5, 150),
+        createNPC(3.5, 15.5),
+        createNPC(10.5, 20.5),
+        createNPC(7.5, 25.5),
+      ],
+      lastTime: performance.now(),
+      stateThrottle: 0,
+    }
+
+    // ── Input ──────────────────────────────────────────────────────
+    const onKeyDown = (e) => { stateRef.current.keys[e.code] = true }
+    const onKeyUp   = (e) => { stateRef.current.keys[e.code] = false }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup',   onKeyUp)
+
+    // Mouse look (pointer lock)
+    let mouseRel = 0
+    const onMouseMove = (e) => { mouseRel += e.movementX }
+    const onMouseDown = (e) => {
+      if (e.button === 0 && !stateRef.current.reloading) {
+        stateRef.current.shooting = true
+        stateRef.current.reloading = true
+        stateRef.current.reloadTimer = 500
+        handleShot()
+      }
+    }
+    canvas.addEventListener('mousemove', onMouseMove)
+    canvas.addEventListener('mousedown', onMouseDown)
+    canvas.addEventListener('click', () => canvas.requestPointerLock?.())
+
+    // ── Shot logic ─────────────────────────────────────────────────
+    const handleShot = () => {
+      const gs = stateRef.current
+      const sin = Math.sin(gs.angle), cos = Math.cos(gs.angle)
+
+      // Simple ray to check NPC hits
+      gs.npcs.forEach(npc => {
+        if (!npc.alive) return
+        const dx = npc.x - gs.x, dy = npc.y - gs.y
+        const dist = Math.hypot(dx, dy)
+        if (dist > 8) return
+        const angleToNpc = Math.atan2(dy, dx)
+        let diff = angleToNpc - gs.angle
+        while (diff > Math.PI)  diff -= 2 * Math.PI
+        while (diff < -Math.PI) diff += 2 * Math.PI
+        if (Math.abs(diff) < 0.15) {
+          npc.health -= 34
+          if (npc.health <= 0) {
+            npc.alive = false
+            const newKills = gs.kills + 1
+            const newScore = gs.score + 100
+            gs.kills = newKills; gs.score = newScore
+            setKills(newKills); setScore(newScore)
+            addEvent(`☠ You killed a demon! +100`)
+            sendGameEvent({ type: 'KILL', victim: null, score: newScore })
+          }
+        }
+      })
+
+      send({ type: 'SHOOT', payload: { x: gs.x, y: gs.y, angle: gs.angle } })
+    }
+
+    // ── Raycasting ─────────────────────────────────────────────────
+    const castRays = (gs) => {
+      const imgData = ctx.createImageData(W, H)
+      const buf = imgData.data
+
+      // Floor & ceiling
+      for (let y = 0; y < H; y++) {
+        const isDark = y < H / 2
+        const c = isDark ? [10,10,10] : [30,30,30]
+        for (let x = 0; x < W; x++) {
+          const i = (y * W + x) * 4
+          buf[i] = c[0]; buf[i+1] = c[1]; buf[i+2] = c[2]; buf[i+3] = 255
+        }
+      }
+
+      const zBuffer = new Float32Array(W)
+
+      for (let ray = 0; ray < NUM_RAYS; ray++) {
+        const rayAngle = gs.angle - HALF_FOV + (ray / NUM_RAYS) * FOV
+        const sinA = Math.sin(rayAngle), cosA = Math.cos(rayAngle)
+
+        let depth = 0, hitWall = 0, texture = 1
+        // DDA
+        const mapX0 = Math.floor(gs.x), mapY0 = Math.floor(gs.y)
+        const deltaDistX = Math.abs(1 / cosA), deltaDistY = Math.abs(1 / sinA)
+        let stepX, stepY, sideDistX, sideDistY
+        let mapX = mapX0, mapY = mapY0
+
+        stepX = cosA < 0 ? -1 : 1
+        sideDistX = cosA < 0 ? (gs.x - mapX) * deltaDistX : (mapX + 1 - gs.x) * deltaDistX
+        stepY = sinA < 0 ? -1 : 1
+        sideDistY = sinA < 0 ? (gs.y - mapY) * deltaDistY : (mapY + 1 - gs.y) * deltaDistY
+
+        let side = 0
+        for (let i = 0; i < MAX_DEPTH * 4; i++) {
+          if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0 }
+          else                        { sideDistY += deltaDistY; mapY += stepY; side = 1 }
+          const key = `${mapX},${mapY}`
+          if (worldMap.has(key)) {
+            const val = MINI_MAP[mapY]?.[mapX] || 1
+            texture = val
+            depth = side === 0 ? sideDistX - deltaDistX : sideDistY - deltaDistY
+            break
+          }
+        }
+
+        // Fix fisheye
+        depth = Math.max(depth * Math.cos(rayAngle - gs.angle), 0.01)
+
+        const projH = Math.min(H, Math.floor(H / depth))
+        const drawStart = Math.floor((H - projH) / 2)
+        const drawEnd   = drawStart + projH
+
+        // Shade by distance
+        const shade = Math.max(0, Math.min(1, 1 - depth / MAX_DEPTH))
+        const base  = WALL_COLORS[texture] || '#888888'
+        const r = parseInt(base.slice(1,3), 16)
+        const g = parseInt(base.slice(3,5), 16)
+        const b = parseInt(base.slice(5,7), 16)
+        const sr = Math.floor(r * shade * (side ? 0.7 : 1))
+        const sg = Math.floor(g * shade * (side ? 0.7 : 1))
+        const sb = Math.floor(b * shade * (side ? 0.7 : 1))
+
+        const screenX = ray * 2  // each ray covers 2px
+        for (let y = drawStart; y < drawEnd; y++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const px = screenX + dx
+            if (px >= W) continue
+            const i = (y * W + px) * 4
+            buf[i] = sr; buf[i+1] = sg; buf[i+2] = sb; buf[i+3] = 255
+          }
+        }
+        zBuffer[screenX] = depth
+        zBuffer[screenX + 1] = depth
+      }
+
+      ctx.putImageData(imgData, 0, 0)
+
+      // ── Sprite rendering (NPCs + remote players) ────────────────
+      const sprites = [
+        ...gs.npcs.map(n => ({ ...n, color: n.alive ? '#cc2200' : '#444', isNpc: true })),
+        ...Object.values(remotePlayers).map(p => ({ x: p.x, y: p.y, color: '#00ccff', size: 0.5 }))
+      ]
+      sprites.sort((a, b) =>
+        Math.hypot(b.x - gs.x, b.y - gs.y) - Math.hypot(a.x - gs.x, a.y - gs.y)
+      )
+
+      sprites.forEach(sp => {
+        const dx = sp.x - gs.x, dy = sp.y - gs.y
+        const dist = Math.hypot(dx, dy)
+        if (dist > MAX_DEPTH || dist < 0.5) return
+
+        const spriteAngle = Math.atan2(dy, dx) - gs.angle
+        let sa = spriteAngle
+        while (sa > Math.PI)  sa -= 2 * Math.PI
+        while (sa < -Math.PI) sa += 2 * Math.PI
+        if (Math.abs(sa) > HALF_FOV + 0.2) return
+
+        const screenX = Math.floor((0.5 + sa / FOV) * W)
+        const size = Math.min(H, Math.floor(H / dist))
+        const drawY = Math.floor((H - size) / 2)
+
+        ctx.save()
+        ctx.globalAlpha = 0.9
+        ctx.fillStyle = sp.color
+        const hw = Math.floor(size * 0.3)
+        for (let sx = screenX - hw; sx < screenX + hw; sx++) {
+          if (sx < 0 || sx >= W) continue
+          if (zBuffer[sx] < dist) continue
+          ctx.fillRect(sx, drawY, 1, size)
+        }
+        ctx.restore()
+      })
+    }
+
+    // ── HUD ────────────────────────────────────────────────────────
+    const drawHUD = (gs) => {
+      // Health bar
+      ctx.fillStyle = 'rgba(0,0,0,0.6)'
+      ctx.fillRect(10, H - 50, 200, 30)
+      const hp = Math.max(0, gs.health)
+      const col = hp > 60 ? '#22cc44' : hp > 30 ? '#ffaa00' : '#cc2200'
+      ctx.fillStyle = col
+      ctx.fillRect(12, H - 48, (196 * hp) / 100, 26)
+      ctx.fillStyle = '#fff'
+      ctx.font = 'bold 14px monospace'
+      ctx.fillText(`HP: ${hp}`, 16, H - 29)
+
+      // Crosshair
+      ctx.strokeStyle = 'rgba(255,255,255,0.8)'
+      ctx.lineWidth = 1.5
+      const cx = W / 2, cy = H / 2
+      ctx.beginPath(); ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10); ctx.stroke()
+
+      // Score
+      ctx.fillStyle = '#ff6600'
+      ctx.font = 'bold 14px monospace'
+      ctx.fillText(`Score: ${gs.score}  Kills: ${gs.kills}`, W - 180, H - 30)
+
+      // Weapon flash
+      if (gs.shooting) {
+        ctx.fillStyle = 'rgba(255,200,0,0.08)'
+        ctx.fillRect(0, 0, W, H)
+        ctx.fillStyle = '#888'
+        ctx.fillRect(W / 2 - 6, H - 80, 12, 60)
+        ctx.fillRect(W / 2 - 20, H - 30, 40, 20)
+      }
+
+      // Minimap
+      const MM = 6, OX = W - 100, OY = 10
+      MINI_MAP.forEach((row, my) => row.forEach((v, mx) => {
+        ctx.fillStyle = v ? '#555' : '#111'
+        ctx.fillRect(OX + mx * MM, OY + my * MM, MM - 1, MM - 1)
+      }))
+      ctx.fillStyle = '#00ff44'
+      ctx.fillRect(OX + gs.x * MM - 2, OY + gs.y * MM - 2, 4, 4)
+      // Remote players on minimap
+      Object.values(remotePlayers).forEach(p => {
+        ctx.fillStyle = '#00ccff'
+        ctx.fillRect(OX + p.x * MM - 2, OY + p.y * MM - 2, 4, 4)
+      })
+    }
+
+    // ── Movement ───────────────────────────────────────────────────
+    const updatePlayer = (gs, dt) => {
+      const speed = PLAYER_SPEED * dt
+      const sin = Math.sin(gs.angle), cos = Math.cos(gs.angle)
+      let dx = 0, dy = 0, moved = 0
+
+      if (gs.keys['KeyW'] || gs.keys['ArrowUp'])    { dx += cos * speed; dy += sin * speed; moved++ }
+      if (gs.keys['KeyS'] || gs.keys['ArrowDown'])  { dx -= cos * speed; dy -= sin * speed; moved++ }
+      if (gs.keys['KeyA'])                           { dx += sin * speed; dy -= cos * speed; moved++ }
+      if (gs.keys['KeyD'])                           { dx -= sin * speed; dy += cos * speed; moved++ }
+
+      if (moved > 1) { dx *= 0.707; dy *= 0.707 }
+
+      const sx = PLAYER_SPEED * 60 / dt
+      const nx = gs.x + dx, ny = gs.y + dy
+      if (!worldMap.has(`${Math.floor(nx + (dx > 0 ? 0.2 : -0.2))},${Math.floor(gs.y)}`))
+        gs.x = nx
+      if (!worldMap.has(`${Math.floor(gs.x)},${Math.floor(ny + (dy > 0 ? 0.2 : -0.2))}`))
+        gs.y = ny
+
+      if (gs.keys['ArrowLeft'])  gs.angle -= PLAYER_ROT_SPD * dt
+      if (gs.keys['ArrowRight']) gs.angle += PLAYER_ROT_SPD * dt
+
+      // Mouse look
+      gs.angle += mouseRel * MOUSE_SENS * dt
+      mouseRel = 0
+      gs.angle = ((gs.angle % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)
+
+      // Reload timer
+      if (gs.reloading) {
+        gs.reloadTimer -= dt
+        if (gs.reloadTimer <= 0) { gs.reloading = false; gs.shooting = false }
+      }
+
+      // NPC AI
+      gs.npcs.forEach(npc => moveNPCtoward(npc, gs.x, gs.y, worldMap, dt))
+
+      // NPC attack player
+      gs.npcs.forEach(npc => {
+        if (!npc.alive) return
+        const d = Math.hypot(npc.x - gs.x, npc.y - gs.y)
+        if (d < 0.8 && Math.random() < 0.001 * dt) {
+          gs.health = Math.max(0, gs.health - 10)
+          setHealth(gs.health)
+          if (gs.health <= 0) {
+            setDeaths(d => d + 1)
+            gs.health = 100; gs.x = 1.5; gs.y = 5.0
+            setHealth(100)
+            addEvent('💀 You died! Respawning...')
+          }
+        }
+      })
+    }
+
+    // ── Main loop ──────────────────────────────────────────────────
+    const loop = (now) => {
+      const gs = stateRef.current
+      const dt = Math.min(now - gs.lastTime, 50)
+      gs.lastTime = now
+
+      if (gamePhase === 'playing' || document.querySelector('#game-canvas')) {
+        updatePlayer(gs, dt)
+        castRays(gs)
+        drawHUD(gs)
+
+        // Throttle WS state updates to ~20/s
+        gs.stateThrottle += dt
+        if (gs.stateThrottle >= 50) {
+          gs.stateThrottle = 0
+          sendPlayerState({
+            x: gs.x, y: gs.y, angle: gs.angle,
+            health: gs.health, score: gs.score, kills: gs.kills,
+            shooting: gs.shooting, timestamp: Date.now()
+          })
+        }
+      }
+
+      animRef.current = requestAnimationFrame(loop)
+    }
+
+    animRef.current = requestAnimationFrame(loop)
+
+    return () => {
+      cancelAnimationFrame(animRef.current)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup',   onKeyUp)
+      canvas.removeEventListener('mousemove', onMouseMove)
+      canvas.removeEventListener('mousedown', onMouseDown)
+    }
+  }, [gamePhase, remotePlayers, sendPlayerState, sendGameEvent, send])
+
+  // ── Start session (creator only) ────────────────────────────────────
+  const startGame = async () => {
+    try {
+      await gameApi.startSession(code)
+    } catch (e) {
+      setError(e.response?.data?.message || 'Failed to start game')
+    }
+  }
+
+  // ── End & submit result ─────────────────────────────────────────────
+  const endGame = async () => {
+    const gs = stateRef.current
+    const dur = gameStartTime ? Math.floor((Date.now() - gameStartTime) / 1000) : elapsed
+    try {
+      await gameApi.submitResult({
+        sessionCode: code,
+        score: gs.score,
+        kills: gs.kills,
+        deaths: deaths,
+        winner: false,
+        durationSeconds: dur,
+      })
+    } catch (_) {}
+    navigate('/dashboard')
+  }
+
+  const isCreator = session?.creatorUsername === user?.username
+  const wsColor = { open: 'text-green-400', connecting: 'text-yellow-400',
+                    closed: 'text-red-400', error: 'text-red-400' }
+
+  return (
+    <div className="space-y-4">
+      {/* Top bar */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-bold text-doom-red glow-red">
+            🎮 {session?.name || code}
+          </h1>
+          <p className="text-gray-500 text-xs">
+            Room: <span className="text-doom-orange font-bold">{code}</span>
+            &nbsp;·&nbsp;
+            <span className={wsColor[wsStatus]}>● WS {wsStatus}</span>
+            &nbsp;·&nbsp;
+            ⏱ {Math.floor(elapsed / 60).toString().padStart(2,'0')}:
+              {(elapsed % 60).toString().padStart(2,'0')}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {isCreator && gamePhase === 'waiting' && (
+            <button onClick={startGame} className="doom-btn">▶ Start Game</button>
+          )}
+          {gamePhase === 'playing' && (
+            <button onClick={endGame} className="doom-btn-outline">⏹ End &amp; Save</button>
+          )}
+          {gamePhase === 'ended' && (
+            <button onClick={endGame} className="doom-btn">Return to Lobby</button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-900/40 border border-red-700 text-red-300 text-sm px-4 py-2 rounded">
+          {error}
+        </div>
+      )}
+
+      <div className="flex gap-4">
+        {/* Game canvas */}
+        <div className="flex-1">
+          <div className="relative">
+            <canvas id="game-canvas" ref={canvasRef}
+              width={W} height={H}
+              className="rounded border border-doom-border w-full block"
+              style={{ maxWidth: W, aspectRatio: `${W}/${H}` }} />
+
+            {gamePhase === 'waiting' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center
+                              bg-black/70 rounded">
+                <p className="text-doom-red text-2xl font-bold glow-red mb-4">
+                  WAITING FOR PLAYERS
+                </p>
+                <p className="text-gray-400 text-sm mb-2">
+                  {players.length} / {session?.maxPlayers || '?'} players connected
+                </p>
+                <p className="text-gray-600 text-xs">
+                  {isCreator ? 'Click "Start Game" when ready' : 'Waiting for host to start…'}
+                </p>
+                <p className="text-gray-600 text-xs mt-4">
+                  Click canvas to lock mouse · WASD to move · Mouse to look · Click to shoot
+                </p>
+              </div>
+            )}
+
+            {gamePhase === 'ended' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center
+                              bg-black/80 rounded">
+                <p className="text-doom-red text-3xl font-bold glow-red mb-4">GAME OVER</p>
+                <p className="text-doom-orange text-xl">Final Score: {score}</p>
+                <p className="text-gray-300 mt-2">Kills: {kills} · Deaths: {deaths}</p>
+              </div>
+            )}
+          </div>
+
+          <p className="text-gray-600 text-xs mt-2 text-center">
+            Click canvas to capture mouse · ESC to release · WASD = move · Mouse = look · LMB = shoot · Arrow keys = rotate
+          </p>
+        </div>
+
+        {/* Sidebar */}
+        <div className="w-48 space-y-3 flex-shrink-0">
+          {/* Stats */}
+          <div className="doom-panel text-xs space-y-2">
+            <p className="text-gray-500 uppercase tracking-widest text-xs mb-2">Stats</p>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Health</span>
+              <span className={health > 60 ? 'text-green-400' : health > 30 ? 'text-yellow-400' : 'text-red-400'}>
+                {health}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Score</span>
+              <span className="text-doom-orange">{score}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Kills</span>
+              <span className="text-red-400">{kills}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">Deaths</span>
+              <span className="text-gray-300">{deaths}</span>
+            </div>
+          </div>
+
+          {/* Players */}
+          <div className="doom-panel text-xs">
+            <p className="text-gray-500 uppercase tracking-widest text-xs mb-2">Players</p>
+            {players.map(p => (
+              <div key={p} className="flex items-center gap-2 py-1">
+                <span className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
+                <span className={p === user?.username ? 'text-doom-orange font-bold' : 'text-gray-300'}>
+                  {p}
+                </span>
+              </div>
+            ))}
+            {players.length === 0 && (
+              <p className="text-gray-600">Connecting...</p>
+            )}
+          </div>
+
+          {/* Event log */}
+          <div className="doom-panel text-xs">
+            <p className="text-gray-500 uppercase tracking-widest text-xs mb-2">Events</p>
+            <div className="space-y-1">
+              {events.map(e => (
+                <p key={e.id} className="text-gray-400 text-xs leading-relaxed">{e.msg}</p>
+              ))}
+              {events.length === 0 && <p className="text-gray-700">No events yet</p>}
+            </div>
+          </div>
+
+          {/* Controls */}
+          <div className="doom-panel text-xs">
+            <p className="text-gray-500 uppercase tracking-widest text-xs mb-2">Controls</p>
+            <div className="space-y-1 text-gray-500">
+              <p>WASD — Move</p>
+              <p>Mouse — Look</p>
+              <p>Click — Shoot</p>
+              <p>Arrows — Rotate</p>
+              <p>ESC — Unlock mouse</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
