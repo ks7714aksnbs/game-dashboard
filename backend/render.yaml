@@ -16,7 +16,6 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
-      - key: PORT
-        value: "8080"
+
     healthCheckPath: /api/leaderboard
     autoDeploy: true
